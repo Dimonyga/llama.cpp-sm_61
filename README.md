@@ -43,6 +43,27 @@ cmake --build build-vulkan --parallel
 
 The two `NO_COOPMAT` options omit cooperative-matrix shaders for a build targeting devices without those features. Leave them off for builds that should also use cooperative matrices on newer GPUs. See [docs/build.md](docs/build.md) for dependencies and platform-specific setup.
 
+## Source archive for a build host
+
+Create `llama.cpp-YYYYMMDDHHmm.tar.gz` in the repository root, or pass an output directory:
+
+```sh
+python3 scripts/package_sources.py
+python3 scripts/package_sources.py /path/to/output
+```
+
+The script needs Python 3 and Git on the packaging machine. It includes current working-tree files from the native source directories, including local edits and new non-ignored source files, all GGML backends, bundled dependencies, licenses, tools and chat templates. It excludes Web UI sources and assets, examples, tests and benchmark suites, documentation directories, CI files, model weights, Git history and Git-ignored build outputs. Native tools such as `llama-bench` remain included. Three small UI build files remain to generate the server's empty asset table. An existing archive with the same name is not overwritten.
+
+Extract on the build host and load the included `source-build.cmake` initial cache. It disables both UI building and prebuilt UI downloads, examples and tests, and preserves the source revision in the build information. Add the backend flags needed for the host, for example Pascal CUDA:
+
+```sh
+tar -xzf llama.cpp-YYYYMMDDHHmm.tar.gz
+cmake -S llama.cpp -B build -C llama.cpp/source-build.cmake \
+    -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=61 \
+    -DGGML_VULKAN=OFF -DGGML_METAL=OFF
+cmake --build build --parallel
+```
+
 The original upstream README follows.
 
 ---

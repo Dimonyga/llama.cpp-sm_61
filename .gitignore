@@ -53,6 +53,7 @@
 /out/
 /tmp/
 /autogen-*.md
+/llama.cpp-*.tar.gz
 /common/build-info.cpp
 
 # Deprecated
