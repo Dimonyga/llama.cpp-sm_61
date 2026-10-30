@@ -1,4 +1,51 @@
-# llama.cpp
+# llama.cpp-sm_61
+
+This is [Dimonyga/llama.cpp-sm_61](https://github.com/Dimonyga/llama.cpp-sm_61), a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) focused on NVIDIA Pascal **sm_61** GPUs and **Vulkan on older AMD Radeon cards**, especially GCN/Vega. It follows upstream and carries targeted performance changes plus selected server, audio and GGML features. Some optimizations are adapted from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp).
+
+## What this fork adds
+
+- **Pascal / sm_61:** DP4A matrix-vector and matrix-matrix tuning, including IQ4_XS; four-row MMVQ dispatch; a GQA-aware single-token Flash Attention path for Q4_0 K/V caches; and changes to GDN and tiled attention for supported shapes. These paths target GPUs such as the GTX 1080 Ti and use architecture and layout checks to select compatible kernels.
+- **Older Radeon / Vulkan:** GCN Q4_0 KV-cache dequantization with transpose, tiled transpose-concat for GDN, and IQ4_XS matrix-vector shader changes. Subgroup RMS normalization and smaller workgroups, initially backported here, are now also part of the merged upstream code. Build options can omit cooperative-matrix shaders on devices that do not support them.
+- **CPU inference:** tiled Flash Attention for Q4_0 and Q8_0 caches, including mixed K/V types, and split-SwiGLU graph fusion in the Qwen3.5 and Qwen3-Next paths.
+- **Audio API:** Gemma 4 transcription and translation prompts, `/v1/audio/translations` with `target_language`, text/JSON/subtitle response formats, an FFmpeg decoding fallback, and `/v1/audio/speech` as an alias of `/tts`. Qwen3-TTS VoiceDesign accepts voice descriptions through `instruct` or `instructions`. See the [server documentation](tools/server/README.md#multimodal-support) and [TTS documentation](tools/tts/README.md).
+- **Server statistics:** `--moe-routing-log` records expert-selection counts; `--tensor-stats` collects activation statistics from served traffic as a GGUF importance matrix for quantization. Both are opt-in and add synchronization overhead.
+- **GGML extensions for stable-diffusion.cpp integration:** FP8 conversion paths, INT8 matrix operations with ConvRot preprocessing, RoPE application, and CUDA SageAttention/SOL attention operators. Support depends on the backend and GPU; SageAttention and SOL attention require newer NVIDIA architectures and are separate from the Pascal optimizations.
+
+Optimizations apply to specific devices, quantization types and tensor layouts. Performance depends on the model, workload, driver and build configuration. The presence of a kernel is not a claim that every supported GPU or model has been benchmarked.
+
+## Build this fork
+
+Clone this repository and build from source to include its changes. The upstream installers, binaries, container images and release badges in the inherited documentation below refer to upstream builds.
+
+```sh
+git clone https://github.com/Dimonyga/llama.cpp-sm_61.git
+cd llama.cpp-sm_61
+```
+
+For NVIDIA Pascal sm_61, use a CUDA toolkit that supports compiling for compute capability 6.1:
+
+```sh
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=61 \
+    -DGGML_VULKAN=OFF -DGGML_METAL=OFF -DLLAMA_BUILD_TESTS=ON
+cmake --build build-cuda --parallel
+```
+
+For older Radeon cards using Vulkan:
+
+```sh
+cmake -S . -B build-vulkan -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF \
+    -DGGML_VULKAN_NO_COOPMAT=ON -DGGML_VULKAN_NO_COOPMAT2=ON \
+    -DLLAMA_BUILD_TESTS=ON
+cmake --build build-vulkan --parallel
+```
+
+The two `NO_COOPMAT` options omit cooperative-matrix shaders for a build targeting devices without those features. Leave them off for builds that should also use cooperative matrices on newer GPUs. See [docs/build.md](docs/build.md) for dependencies and platform-specific setup.
+
+The original upstream README follows.
+
+---
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
