@@ -460,6 +460,21 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;
 
+    // the allocator may place weights or ids on the logits, and topk_moe_cuda only synchronizes within a block
+    ggml_cuda_pool_alloc<float> logits_copy(ctx.pool());
+    if (n_rows > TOPK_MOE_ROWS_PER_BLOCK || n_expert_used == n_experts) {
+        const size_t nbytes = ggml_nbytes(logits);
+        auto overlaps = [logits_d, nbytes](const ggml_tensor * t) {
+            const char * l = (const char *) logits_d;
+            const char * d = (const char *) t->data;
+            return d < l + nbytes && l < d + ggml_nbytes(t);
+        };
+        if (overlaps(weights) || overlaps(ids)) {
+            CUDA_CHECK(cudaMemcpyAsync(logits_copy.alloc(ggml_nelements(logits)), logits_d, nbytes, cudaMemcpyDeviceToDevice, ctx.stream()));
+            logits_d = logits_copy.get();
+        }
+    }
+
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
                              scale_val, config);

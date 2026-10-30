@@ -74,7 +74,7 @@ static llama_token try_draft(common_ngram_cache & nc_static, const common_ngram 
     int sum_count_static  = 0;
     llama_token max_token = LLAMA_TOKEN_NULL;
 
-    for (std::pair<llama_token, int> token_count_static : part_static) {
+    for (const auto & token_count_static : part_static) {
         const llama_token token = token_count_static.first;
         const int32_t count_static  = token_count_static.second;
 
@@ -96,15 +96,16 @@ static llama_token try_draft(common_ngram_cache & nc_static, const common_ngram 
 
 // Try to draft a token from primary cache (context/dynamic), validate with static cache:
 static llama_token try_draft(
-    common_ngram_cache & nc_primary, const std::vector<common_ngram> & ngrams_primary, const common_ngram_cache_part & part_static,
+    const common_ngram_cache & nc_primary, const std::vector<std::pair<int, common_ngram>> & ngrams_primary, const common_ngram_cache_part & part_static,
     const int * min_sample_size, const int * min_percent) {
 
     llama_token drafted_token = LLAMA_TOKEN_NULL;
 
-    for (int i = ngrams_primary.size()-1; i >= 0 && drafted_token == LLAMA_TOKEN_NULL; --i) {
-        const common_ngram ngram_primary = ngrams_primary[i];
+    for (size_t i = ngrams_primary.size(); i > 0 && drafted_token == LLAMA_TOKEN_NULL; --i) {
+        const int ngram_size = ngrams_primary[i - 1].first;
+        const common_ngram ngram_primary = ngrams_primary[i - 1].second;
 
-        common_ngram_cache::iterator part_primary_it = nc_primary.find(ngram_primary);
+        common_ngram_cache::const_iterator part_primary_it = nc_primary.find(ngram_primary);
         if (part_primary_it == nc_primary.end()) {
             continue;
         }
@@ -115,7 +116,7 @@ static llama_token try_draft(
         int sum_count_primary = 0;
         llama_token max_token = LLAMA_TOKEN_NULL;
 
-        for (std::pair<llama_token, int> token_count_primary : part_primary) {
+        for (const auto & token_count_primary : part_primary) {
             const llama_token token = token_count_primary.first;
 
             common_ngram_cache_part::const_iterator token_count_static_it = part_static.find(token);
@@ -131,11 +132,13 @@ static llama_token try_draft(
             sum_count_primary += count_primary;
         }
 
-        if (sum_count_primary < min_sample_size[i]) {
+        const int threshold_index = ngram_size - 1;
+        GGML_ASSERT(threshold_index >= 0 && threshold_index < LLAMA_NGRAM_MAX);
+        if (sum_count_primary < min_sample_size[threshold_index]) {
             continue;
         }
-        if (100*max_count_primary < min_percent[i]*sum_count_primary) {
-            continue;;
+        if (100*max_count_primary < min_percent[threshold_index]*sum_count_primary) {
+            continue;
         }
         drafted_token = max_token;
     }
@@ -148,33 +151,41 @@ void common_ngram_cache_draft(
     common_ngram_cache & nc_context, common_ngram_cache & nc_dynamic, common_ngram_cache & nc_static
 ) {
     GGML_ASSERT(draft.size() == 1);
-    const int inp_size = inp.size();
-
-    if (inp_size < LLAMA_NGRAM_STATIC) {
+    if (inp.size() < LLAMA_NGRAM_STATIC) {
         return;
     }
 
     while ((int) draft.size()-1 < n_draft) {
         llama_token drafted_token = LLAMA_TOKEN_NULL;
+        const size_t n_available = inp.size() + draft.size() - 1;
 
-        const int ngram_start_static = inp_size-LLAMA_NGRAM_STATIC + draft.size()-1;
+        const int ngram_max_available = std::min(ngram_max,
+                static_cast<int>(std::min<size_t>(n_available, LLAMA_NGRAM_MAX)));
+
         common_ngram ngram_static;
-        for (int j = ngram_start_static; j < ngram_start_static + LLAMA_NGRAM_STATIC; ++j) {
-            ngram_static.tokens[j-ngram_start_static] = get_token(inp, draft, j);
+        if (n_available >= LLAMA_NGRAM_STATIC) {
+            const size_t ngram_start_static = n_available - LLAMA_NGRAM_STATIC;
+            for (size_t j = ngram_start_static; j < ngram_start_static + LLAMA_NGRAM_STATIC; ++j) {
+                ngram_static.tokens[j-ngram_start_static] = get_token(inp, draft, j);
+            }
         }
         static const common_ngram_cache_part part_static_empty;
-        common_ngram_cache::const_iterator part_static_it = nc_static.find(ngram_static);
-        const common_ngram_cache_part & part_static = part_static_it != nc_static.end() ? part_static_it->second : part_static_empty;
+        common_ngram_cache::const_iterator part_static_it = n_available >= LLAMA_NGRAM_STATIC
+                ? nc_static.find(ngram_static)
+                : nc_static.end();
+        const common_ngram_cache_part & part_static = part_static_it != nc_static.end()
+                ? part_static_it->second
+                : part_static_empty;
 
         // cd = context + dynamic
-        std::vector<common_ngram> ngrams_cd;
-        for (int ngram_size_cd = ngram_min; ngram_size_cd <= ngram_max; ++ngram_size_cd) {
-            const int ngram_start_cd = inp_size-ngram_size_cd + draft.size()-1;
+        std::vector<std::pair<int, common_ngram>> ngrams_cd;
+        for (int ngram_size_cd = ngram_min; ngram_size_cd <= ngram_max_available; ++ngram_size_cd) {
+            const size_t ngram_start_cd = n_available - ngram_size_cd;
             common_ngram ngram_cd;
-            for (int j = ngram_start_cd; j < ngram_start_cd + ngram_size_cd; ++j) {
+            for (size_t j = ngram_start_cd; j < ngram_start_cd + ngram_size_cd; ++j) {
                 ngram_cd.tokens[j-ngram_start_cd] = get_token(inp, draft, j);
             }
-            ngrams_cd.push_back(ngram_cd);
+            ngrams_cd.emplace_back(ngram_size_cd, ngram_cd);
         }
         if (drafted_token == LLAMA_TOKEN_NULL) {
             drafted_token = try_draft(nc_context, ngrams_cd, part_static, draft_min_sample_size_lax, draft_min_percent_lax);
@@ -182,7 +193,7 @@ void common_ngram_cache_draft(
         if (drafted_token == LLAMA_TOKEN_NULL) {
             drafted_token = try_draft(nc_dynamic, ngrams_cd, part_static, draft_min_sample_size_strict, draft_min_percent_strict);
         }
-        if (drafted_token == LLAMA_TOKEN_NULL) {
+        if (drafted_token == LLAMA_TOKEN_NULL && n_available >= LLAMA_NGRAM_STATIC) {
             drafted_token = try_draft(nc_static, ngram_static);
         }
 
@@ -197,16 +208,16 @@ void common_ngram_cache_draft(
 
 void common_ngram_cache_save(common_ngram_cache & ngram_cache, const std::string & filename) {
     std::ofstream file_out(filename, std::ios::binary);
-    for (std::pair<common_ngram, common_ngram_cache_part> item : ngram_cache) {
-        const common_ngram      ngram        = item.first;
-        common_ngram_cache_part token_counts = item.second;
+    for (const auto & item : ngram_cache) {
+        const common_ngram &            ngram        = item.first;
+        const common_ngram_cache_part & token_counts = item.second;
         GGML_ASSERT(!token_counts.empty());
         const int32_t ntokens = token_counts.size();
         GGML_ASSERT(ntokens > 0);
 
         file_out.write(reinterpret_cast<const char *>(&ngram),   sizeof(common_ngram));
         file_out.write(reinterpret_cast<const char *>(&ntokens), sizeof(int32_t));
-        for (std::pair<llama_token, int32_t> item2 : token_counts) {
+        for (const auto & item2 : token_counts) {
             const llama_token token = item2.first;
             const int32_t     count = item2.second;
             GGML_ASSERT(count > 0);
@@ -256,9 +267,9 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename) {
 }
 
 void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add) {
-    for (std::pair<common_ngram, common_ngram_cache_part> ngram_part : ngram_cache_add) {
-        const common_ngram      ngram = ngram_part.first;
-        common_ngram_cache_part  part = ngram_part.second;
+    for (const auto & ngram_part : ngram_cache_add) {
+        const common_ngram &            ngram = ngram_part.first;
+        const common_ngram_cache_part & part  = ngram_part.second;
 
         common_ngram_cache::iterator part_merged_it = ngram_cache_target.find(ngram);
         if (part_merged_it == ngram_cache_target.end()) {
@@ -266,7 +277,7 @@ void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ng
             continue;
         }
 
-        for (std::pair<llama_token, int32_t> token_count : part) {
+        for (const auto & token_count : part) {
             const llama_token token = token_count.first;
             const int32_t     count = token_count.second;
             GGML_ASSERT(count > 0);

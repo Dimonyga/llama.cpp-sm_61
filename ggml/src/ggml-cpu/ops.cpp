@@ -1752,11 +1752,103 @@ static void ggml_compute_forward_repeat_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
+    GGML_ASSERT(ggml_can_repeat(src0, dst));
+
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && src0->ne[0] == 1 && ggml_nrows(src0) == ggml_nrows(dst)) {
+        const int ith = params->ith;
+        const int nth = params->nth;
+        const int64_t nr = ggml_nrows(dst);
+        const int64_t nc = dst->ne[0];
+        const int64_t dr = (nr + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(nr, ir0 + dr);
+        const float * x = (const float *)src0->data;
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            float * y = (float *)((char *)dst->data + ir*dst->nb[1]);
+            for (int64_t j = 0; j < nc; ++j) {
+                y[j] = x[ir];
+            }
+        }
         return;
     }
 
-    GGML_ASSERT(ggml_can_repeat(src0, dst));
+    int n_repeated_dims = 0;
+    int repeated_dim = -1;
+    for (int idim = 0; idim < GGML_MAX_DIMS; ++idim) {
+        if (src0->ne[idim] != dst->ne[idim]) {
+            ++n_repeated_dims;
+            repeated_dim = idim;
+        }
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    if (n_repeated_dims == 1 && repeated_dim > 0 && src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+        const int64_t nr  = ggml_nrows(dst);
+        const int64_t dr  = (nr + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+        const int64_t n1 = dst->ne[1], n2 = dst->ne[2];
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            int64_t i[4];
+            i[0] = 0;
+            i[3] = ir/(n2*n1);
+            i[2] = (ir - i[3]*n2*n1)/n1;
+            i[1] = ir - i[3]*n2*n1 - i[2]*n1;
+            char * dst_ptr = (char *)dst->data + i[1]*dst->nb[1] + i[2]*dst->nb[2] + i[3]*dst->nb[3];
+            i[repeated_dim] %= src0->ne[repeated_dim];
+            const char * src_ptr = (const char *)src0->data + i[1]*src0->nb[1] + i[2]*src0->nb[2] + i[3]*src0->nb[3];
+            memcpy(dst_ptr, src_ptr, dst->ne[0]*sizeof(float));
+        }
+        return;
+    }
+
+    if (n_repeated_dims == 1) {
+        GGML_ASSERT(repeated_dim >= 0 && repeated_dim < GGML_MAX_DIMS);
+        int64_t nrows = 1;
+        for (int idim = 0; idim < GGML_MAX_DIMS; ++idim) {
+            if (src0->ne[idim] == dst->ne[idim]) {
+                nrows *= dst->ne[idim];
+            }
+        }
+        int64_t nrows_per_thread = (nrows + nth - 1)/nth;
+        int64_t first_row = ith*nrows_per_thread;
+        int64_t last_row = MIN(first_row + nrows_per_thread, nrows);
+        for (int64_t ir = first_row; ir < last_row; ++ir) {
+            int64_t ii = ir;
+            int64_t denom = nrows;
+            size_t offset_src = 0;
+            size_t offset_dst = 0;
+            for (int idim = GGML_MAX_DIMS-1; idim >= 0; --idim) {
+                if (idim == repeated_dim) continue;
+                denom /= dst->ne[idim];
+                int64_t idx = ii / denom;
+                ii -= idx * denom;
+                offset_src += idx*src0->nb[idim];
+                offset_dst += idx*dst->nb[idim];
+            }
+            char * dst_ptr = (char *)dst->data + offset_dst;
+            const char * src_ptr = (const char *)src0->data + offset_src;
+            if (src0->ne[repeated_dim] == 1) {
+                float value = *(const float *)src_ptr;
+                for (int i = 0; i < (int)dst->ne[repeated_dim]; ++i) {
+                    *(float *)(dst_ptr + i*dst->nb[repeated_dim]) = value;
+                }
+            } else {
+                for (int i = 0; i < (int)dst->ne[repeated_dim]; ++i) {
+                    int i0 = i % src0->ne[repeated_dim];
+                    float value = *(const float *)(src_ptr + i0*src0->nb[repeated_dim]);
+                    *(float *)(dst_ptr + i*dst->nb[repeated_dim]) = value;
+                }
+            }
+        }
+        return;
+    }
+
+    if (params->ith != 0) {
+        return;
+    }
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
@@ -1796,11 +1888,43 @@ static void ggml_compute_forward_repeat_f16(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
+    GGML_ASSERT(ggml_can_repeat(src0, dst));
+
+    int n_repeated_dims = 0;
+    int repeated_dim = -1;
+    for (int idim = 0; idim < GGML_MAX_DIMS; ++idim) {
+        if (src0->ne[idim] != dst->ne[idim]) {
+            ++n_repeated_dims;
+            repeated_dim = idim;
+        }
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    if (n_repeated_dims == 1 && repeated_dim > 0 && src0->nb[0] == sizeof(ggml_fp16_t) && dst->nb[0] == sizeof(ggml_fp16_t)) {
+        const int64_t nr  = ggml_nrows(dst);
+        const int64_t dr  = (nr + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+        const int64_t n1 = dst->ne[1], n2 = dst->ne[2];
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            int64_t i[4];
+            i[0] = 0;
+            i[3] = ir/(n2*n1);
+            i[2] = (ir - i[3]*n2*n1)/n1;
+            i[1] = ir - i[3]*n2*n1 - i[2]*n1;
+            char * dst_ptr = (char *)dst->data + i[1]*dst->nb[1] + i[2]*dst->nb[2] + i[3]*dst->nb[3];
+            i[repeated_dim] %= src0->ne[repeated_dim];
+            const char * src_ptr = (const char *)src0->data + i[1]*src0->nb[1] + i[2]*src0->nb[2] + i[3]*src0->nb[3];
+            memcpy(dst_ptr, src_ptr, dst->ne[0]*sizeof(ggml_fp16_t));
+        }
         return;
     }
 
-    GGML_ASSERT(ggml_can_repeat(src0, dst));
+    if (params->ith != 0) {
+        return;
+    }
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
@@ -4021,52 +4145,53 @@ static void ggml_compute_forward_norm_f32(
 
     GGML_ASSERT(eps >= 0.0f);
 
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const char * x = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
-                char * y = (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3;
+    const int64_t nr = ne01*ne02*ne03;
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
 
-                if (nb00 == sizeof(float) && nb0 == sizeof(float)) {
-                    const float * xf = (const float *) x;
+        const char * x = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+        char * y = (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3;
 
-                    float sum = 0.0;
-                    ggml_vec_sum_f32(ne00, &sum, xf);
-                    float mean = sum/ne00;
+        if (nb00 == sizeof(float) && nb0 == sizeof(float)) {
+            const float * xf = (const float *) x;
 
-                    float * yf = (float *) y;
-                    float variance = 0;
+            float sum = 0.0;
+            ggml_vec_sum_f32(ne00, &sum, xf);
+            float mean = sum/ne00;
+
+            float * yf = (float *) y;
+            float variance = 0;
 
 #ifdef GGML_USE_ACCELERATE
-                    mean = -mean;
-                    vDSP_vsadd(xf, 1, &mean, yf, 1, ne00);
-                    vDSP_measqv(yf, 1, &variance, ne00);
+            mean = -mean;
+            vDSP_vsadd(xf, 1, &mean, yf, 1, ne00);
+            vDSP_measqv(yf, 1, &variance, ne00);
 #else
-                    variance = ggml_vec_cvar_f32(ne00, yf, xf, mean);
+            variance = ggml_vec_cvar_f32(ne00, yf, xf, mean);
 #endif //GGML_USE_ACCELERATE
 
-                    const float scale = 1.0f/sqrtf(variance + eps);
-                    ggml_vec_scale_f32(ne00, yf, scale);
-                } else {
-                    float sum = 0.0;
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        sum += *(const float *) (x + i00*nb00);
-                    }
-                    const float mean = sum/ne00;
+            const float scale = 1.0f/sqrtf(variance + eps);
+            ggml_vec_scale_f32(ne00, yf, scale);
+        } else {
+            float sum = 0.0;
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                sum += *(const float *) (x + i00*nb00);
+            }
+            const float mean = sum/ne00;
 
-                    float variance = 0.0f;
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        const float v = *(const float *) (x + i00*nb00) - mean;
-                        *(float *) (y + i00*nb0) = v;
-                        variance += v * v;
-                    }
-                    variance /= ne00;
+            float variance = 0.0f;
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                const float v = *(const float *) (x + i00*nb00) - mean;
+                *(float *) (y + i00*nb0) = v;
+                variance += v * v;
+            }
+            variance /= ne00;
 
-                    const float scale = 1.0f/sqrtf(variance + eps);
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        *(float *) (y + i00*nb0) *= scale;
-                    }
-                }
+            const float scale = 1.0f/sqrtf(variance + eps);
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                *(float *) (y + i00*nb0) *= scale;
             }
         }
     }
@@ -4127,40 +4252,40 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+    const int64_t nr = ne01*ne02*ne03;
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+        const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                const float mean  = sum/ne00;
-                const float scale = 1.0f/sqrtf(mean + eps);
+        ggml_float sum = 0.0;
+        // worth switching to explicit SIMD?
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            sum += (ggml_float)(x[i00] * x[i00]);
+        }
 
-                // if you hit this, likely you got an inf somewhere earlier
-                assert(scale > 0.0f);
+        const float mean  = sum/ne00;
+        const float scale = 1.0f/sqrtf(mean + eps);
 
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+        // if you hit this, likely you got an inf somewhere earlier
+        assert(scale > 0.0f);
 
-                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
-                    const int64_t i11 = i01 % ne11;
-                    const int64_t i12 = i02 % ne12;
-                    const int64_t i13 = i03 % ne13;
-                    const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+        float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
-                    }
-                } else {
-                    memcpy(y, x, ne00 * sizeof(float));
-                    ggml_vec_scale_f32(ne00, y, scale);
-                }
+        if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
+            const int64_t i11 = i01 % ne11;
+            const int64_t i12 = i02 % ne12;
+            const int64_t i13 = i03 % ne13;
+            const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                y[i00] = x[i00] * scale * w[i00];
             }
+        } else {
+            memcpy(y, x, ne00 * sizeof(float));
+            ggml_vec_scale_f32(ne00, y, scale);
         }
     }
 }
@@ -4497,31 +4622,31 @@ static void ggml_compute_forward_l2_norm_f32(
 
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const char * x = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
+    const int64_t nr = ne01*ne02*ne03;
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
 
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    const float xi = *(const float *) (x + i00*nb00);
-                    sum += (ggml_float)(xi * xi);
-                }
+        const char * x = (const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03;
 
-                const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
+        ggml_float sum = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            const float xi = *(const float *) (x + i00*nb00);
+            sum += (ggml_float)(xi * xi);
+        }
 
-                char * y = (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3;
+        const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
 
-                if (nb00 == sizeof(float) && nb0 == sizeof(float)) {
-                    memcpy(y, x, ne00 * sizeof(float));
-                    ggml_vec_scale_f32(ne00, (float *) y, scale);
-                } else {
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        const float xi = *(const float *) (x + i00*nb00);
-                        *(float *) (y + i00*nb0) = xi * scale;
-                    }
-                }
+        char * y = (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3;
+
+        if (nb00 == sizeof(float) && nb0 == sizeof(float)) {
+            memcpy(y, x, ne00 * sizeof(float));
+            ggml_vec_scale_f32(ne00, (float *) y, scale);
+        } else {
+            for (int64_t i00 = 0; i00 < ne00; i00++) {
+                const float xi = *(const float *) (x + i00*nb00);
+                *(float *) (y + i00*nb0) = xi * scale;
             }
         }
     }
@@ -6452,6 +6577,10 @@ static void ggml_compute_forward_rope_flt(
 
     for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
         for (int64_t i2 = 0; i2 < ne2; i2++) { // seq-len
+            if (ir + ne1 <= ir0 || ir >= ir1) {
+                ir += ne1;
+                continue;
+            }
             for (int64_t i1 = 0; i1 < ne1; i1++) { // attn-heads
                 if (ir++ < ir0) continue; // skip rows mapped to other threads
                 if (ir   > ir1) break;
@@ -7968,16 +8097,19 @@ static void ggml_compute_forward_pool_1d_ksp(
 
     assert(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
 
-    if (params->ith != 0) {
-        return;
-    }
+    const int ith = params->ith;
+    const int nth = params->nth;
 
     const int64_t IW = src->ne[0];
     const int64_t OW = dst->ne[0];
 
     const int64_t nr = ggml_nrows(src);
 
-    for (int64_t ir = 0; ir < nr; ++ir) {
+    const int64_t dr = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
         const char * srow_bytes =            (const char *) src->data + ir * src->nb[1];
         float      * drow       = (float *) ((      char *) dst->data + ir * dst->nb[1]);
 

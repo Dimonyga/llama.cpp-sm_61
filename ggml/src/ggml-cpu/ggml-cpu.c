@@ -2475,6 +2475,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_REPEAT:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_LEAKY_RELU:
             {
@@ -2597,6 +2600,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_POOL_1D:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_POOL_2D:
         case GGML_OP_POOL_2D_BACK:
             {

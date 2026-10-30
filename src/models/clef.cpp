@@ -487,7 +487,11 @@ ggml_tensor * llama_model_clef::graph::build_layer_attn_linear(
     // gated normalization
     ggml_tensor * z_4d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_tokens, n_seqs);
     output = build_norm(output, layer.ssm_norm, nullptr, LLM_NORM_RMS, il);
-    output = ggml_mul(ctx0, output, ggml_silu(ctx0, z_4d));
+    if (ggml_is_contiguous_1(z_4d) && ggml_is_contiguous_1(output)) {
+        output = ggml_swiglu_split(ctx0, z_4d, output);
+    } else {
+        output = ggml_mul(ctx0, output, ggml_silu(ctx0, z_4d));
+    }
 
     output = ggml_reshape_3d(ctx0, output, head_v_dim * num_v_heads, n_tokens, n_seqs);
 
