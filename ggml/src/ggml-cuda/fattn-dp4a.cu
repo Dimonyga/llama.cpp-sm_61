@@ -2,7 +2,8 @@
 //
 // The QK^T half of attention runs on __dp4a with per-token int8 scales (K is smoothed by subtracting its
 // per-head channel mean, which leaves the softmax unchanged); the PV half stays in FP32. Targets
-// unmasked, non-GQA attention with head size 128 and F16 K/V, i.e. the image diffusion transformers.
+// non-GQA attention with head size 128, F16 K/V and an optional F16 mask, for callers that opted in with
+// ggml_flash_attn_ext_set_approx (the image diffusion transformers).
 
 #include "fattn-dp4a.cuh"
 
@@ -20,6 +21,8 @@ struct fattn_dp4a_strides {
     int64_t q1, q2, q3; // bytes
     int64_t k1, k2, k3;
     int64_t v1, v2, v3;
+    int64_t m1, m3;     // mask row and batch strides in bytes
+    int n_mask_batch;
 };
 
 static __device__ __forceinline__ float fattn_dp4a_block_amax(float v, float * sh) {
@@ -81,7 +84,7 @@ static __global__ void fattn_dp4a_quant_q(const char * Q, int8_t * Qq, float * Q
 }
 
 static __global__ __launch_bounds__(DP4A_NT, 2) void fattn_dp4a_fwd(
-        const int8_t * Qq, const float * Qs, const int8_t * Kq, const float * Ks, const char * V, float * dst,
+        const int8_t * Qq, const float * Qs, const int8_t * Kq, const float * Ks, const char * V, const char * mask, float * dst,
         const int n_q, const int n_q_pad, const int n_kv, const int n_kv_pad, const int n_head, const fattn_dp4a_strides s) {
     __shared__ __align__(16) int8_t sQ[DP4A_BQ*DP4A_QS];
     __shared__ __align__(16) int8_t sK[DP4A_BK*DP4A_QS];
@@ -114,6 +117,7 @@ static __global__ __launch_bounds__(DP4A_NT, 2) void fattn_dp4a_fwd(
     }
 
     const char * Vh = V + b*s.v3 + h*s.v2;
+    const char * Mh = mask != nullptr ? mask + (b % s.n_mask_batch)*s.m3 : nullptr;
 
     for (int kt = 0; kt < n_kv; kt += DP4A_BK) {
         __syncthreads();
@@ -170,18 +174,24 @@ static __global__ __launch_bounds__(DP4A_NT, 2) void fattn_dp4a_fwd(
             float mx = -INFINITY;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                p[i][j] = kt + j*8 + tx < n_kv ? (float) acc[i][j]*qs*sKs[j*8 + tx] : -INFINITY;
+                float v = (float) acc[i][j]*qs*sKs[j*8 + tx];
+                if (Mh != nullptr && kt + j*8 + tx < n_kv) {
+                    const int q = min(qb + ty*4 + i, n_q - 1);
+                    v += __half2float(*(const half *) (Mh + q*s.m1 + (kt + j*8 + tx)*sizeof(half)))*1.44269504f;
+                }
+                p[i][j] = kt + j*8 + tx < n_kv ? v : -INFINITY;
                 mx = fmaxf(mx, p[i][j]);
             }
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 4));
             const float mn    = fmaxf(m[i], mx);
-            const float alpha = exp2f(m[i] - mn);
+            const float mref  = mn == -INFINITY ? 0.0f : mn; // fully masked so far
+            const float alpha = exp2f(m[i] - mref);
             float ls = 0.0f;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                p[i][j] = exp2f(p[i][j] - mn);
+                p[i][j] = exp2f(p[i][j] - mref);
                 ls += p[i][j];
             }
             l[i] = l[i]*alpha + ls;
@@ -221,7 +231,7 @@ static __global__ __launch_bounds__(DP4A_NT, 2) void fattn_dp4a_fwd(
         lt += __shfl_xor_sync(0xffffffff, lt, 1);
         lt += __shfl_xor_sync(0xffffffff, lt, 2);
         lt += __shfl_xor_sync(0xffffffff, lt, 4);
-        const float inv = 1.0f/lt;
+        const float inv = lt > 0.0f ? 1.0f/lt : 0.0f;
         const int q = qb + ty*4 + i;
         if (q < n_q) {
 #pragma unroll
@@ -249,6 +259,10 @@ bool ggml_cuda_fattn_dp4a_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
+    if (!ggml_flash_attn_ext_get_approx(dst)) {
+        return false;
+    }
+
     const int cc = ggml_cuda_info().devices[device].cc;
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_DP4A || fast_fp16_available(cc) || turing_mma_available(cc)) {
         return false;
@@ -257,7 +271,11 @@ bool ggml_cuda_fattn_dp4a_supported(int device, const ggml_tensor * dst) {
     float max_bias = 0.0f, softcap = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
-    if (mask != nullptr || dst->src[4] != nullptr || max_bias != 0.0f || softcap != 0.0f) {
+    if (dst->src[4] != nullptr || max_bias != 0.0f || softcap != 0.0f) {
+        return false;
+    }
+    if (mask != nullptr && (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[1] < Q->ne[1] ||
+                            mask->ne[2] != 1 || Q->ne[3] % mask->ne[3] != 0 || mask->nb[0] != sizeof(half))) {
         return false;
     }
     if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
@@ -287,6 +305,7 @@ void ggml_cuda_flash_attn_ext_dp4a(ggml_backend_cuda_context & ctx, ggml_tensor 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
 
     const int n_q    = Q->ne[1];
     const int n_kv   = K->ne[1];
@@ -302,6 +321,8 @@ void ggml_cuda_flash_attn_ext_dp4a(ggml_backend_cuda_context & ctx, ggml_tensor 
         (int64_t) Q->nb[1], (int64_t) Q->nb[2], (int64_t) Q->nb[3],
         (int64_t) K->nb[1], (int64_t) K->nb[2], (int64_t) K->nb[3],
         (int64_t) V->nb[1], (int64_t) V->nb[2], (int64_t) V->nb[3],
+        mask != nullptr ? (int64_t) mask->nb[1] : 0, mask != nullptr ? (int64_t) mask->nb[3] : 0,
+        mask != nullptr ? (int) mask->ne[3] : 1,
     };
 
     ggml_cuda_pool & pool = ctx.pool();
@@ -317,6 +338,6 @@ void ggml_cuda_flash_attn_ext_dp4a(ggml_backend_cuda_context & ctx, ggml_tensor 
     // softmax is evaluated with exp2, so fold log2(e) into the Q scale
     fattn_dp4a_quant_q<<<dim3(n_q_pad, n_seq), DP4A_D, 0, stream>>>((const char *) Q->data, Qq.get(), Qs.get(), n_q, n_q_pad, n_head, scale*1.44269504f, s);
     fattn_dp4a_fwd<<<dim3(n_q_pad/DP4A_BQ, n_seq), DP4A_NT, 0, stream>>>(
-        Qq.get(), Qs.get(), Kq.get(), Ks.get(), (const char *) V->data, (float *) dst->data, n_q, n_q_pad, n_kv, n_kv_pad, n_head, s);
+        Qq.get(), Qs.get(), Kq.get(), Ks.get(), (const char *) V->data, mask != nullptr ? (const char *) mask->data : nullptr, (float *) dst->data, n_q, n_q_pad, n_kv, n_kv_pad, n_head, s);
     CUDA_CHECK(cudaGetLastError());
 }

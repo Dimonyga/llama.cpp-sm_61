@@ -2586,6 +2586,15 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Allow backends to trade a little accuracy for speed in this attention (e.g. INT8 QK^T on GPUs with dp4a).
+    // Meant for diffusion models; text generation keeps the exact kernels.
+    GGML_API void ggml_flash_attn_ext_set_approx(
+            struct ggml_tensor * a,
+            bool                 approx);
+
+    GGML_API bool ggml_flash_attn_ext_get_approx(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
