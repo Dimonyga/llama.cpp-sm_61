@@ -5787,14 +5787,14 @@ void ggml_flash_attn_ext_set_approx(
         bool                 approx) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
 
-    ggml_set_op_params_i32(a, 4, approx ? 1 : 0);
+    ggml_set_op_params_i32(a, 5, approx ? 1 : 0); // slot 4 is n_kv_max
 }
 
 bool ggml_flash_attn_ext_get_approx(
         const struct ggml_tensor * a) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
 
-    return ggml_get_op_params_i32(a, 4) != 0;
+    return ggml_get_op_params_i32(a, 5) != 0;
 }
 
 void ggml_flash_attn_ext_add_sinks(
