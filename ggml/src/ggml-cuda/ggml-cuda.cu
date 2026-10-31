@@ -1825,6 +1825,59 @@ static bool ggml_cuda_op_quantize_i8_convrot(
     return true;
 }
 
+// Few-token INT8 tensorwise mat-vec: one warp per output feature, dp4a over 16-byte chunks of the weight row.
+// `src1` is the already quantized activation (I8 rows, k bytes each) with one scale per row.
+template <int ncols>
+static __global__ void mul_mat_vec_i8_tensorwise_cuda(
+        const int8_t * __restrict__ weight, const int8_t * __restrict__ act, const float * __restrict__ act_scales,
+        const float * __restrict__ weight_scales, const float * __restrict__ bias, float * __restrict__ dst,
+        const int64_t k, const int64_t n) {
+    const int lane = threadIdx.x & 31;
+    const int64_t out = (int64_t) blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    if (out >= n) {
+        return;
+    }
+    const int4 * w4 = (const int4 *) (weight + out * k);
+    int acc[ncols] = {};
+    const int64_t n_chunks = k / 16;
+    for (int64_t c = lane; c < n_chunks; c += 32) {
+        const int4 w = __ldg(w4 + c);
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const int4 a = __ldg((const int4 *) (act + (int64_t) j * k) + c);
+            acc[j] = __dp4a(w.x, a.x, acc[j]);
+            acc[j] = __dp4a(w.y, a.y, acc[j]);
+            acc[j] = __dp4a(w.z, a.z, acc[j]);
+            acc[j] = __dp4a(w.w, a.w, acc[j]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc[j] += __shfl_xor_sync(0xffffffff, acc[j], offset);
+        }
+    }
+    if (lane == 0) {
+        const float ws = weight_scales != nullptr ? weight_scales[out] : 1.0f;
+        const float b  = bias != nullptr ? bias[out] : 0.0f;
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            dst[(int64_t) j * n + out] = (float) acc[j] * act_scales[j] * ws + b;
+        }
+    }
+}
+
+template <int ncols>
+static void launch_mul_mat_vec_i8_tensorwise(
+        cudaStream_t stream, const int8_t * weight, const int8_t * act, const float * act_scales,
+        const float * weight_scales, const float * bias, float * dst, int64_t k, int64_t n) {
+    constexpr int warps_per_block = 4;
+    const dim3 grid((n + warps_per_block - 1) / warps_per_block);
+    mul_mat_vec_i8_tensorwise_cuda<ncols><<<grid, warps_per_block*32, 0, stream>>>(
+        weight, act, act_scales, weight_scales, bias, dst, k, n);
+}
+
 static void ggml_cuda_mul_mat_i8(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
@@ -1874,6 +1927,24 @@ static void ggml_cuda_mul_mat_i8(
 
     const float * weight_scales = dst->src[2] != nullptr ? (const float *)dst->src[2]->data : nullptr;
     const float * bias          = dst->src[3] != nullptr ? (const float *)dst->src[3]->data : nullptr;
+
+    if (rows <= 8 && k % 16 == 0 && cc >= GGML_CUDA_CC_DP4A) {
+        const int8_t * w = (const int8_t *) src0->data;
+        float * out      = (float *) dst->data;
+        switch (rows) {
+            case 1: launch_mul_mat_vec_i8_tensorwise<1>(stream, w, qdata_d, scales_d, weight_scales, bias, out, k, n); break;
+            case 2: launch_mul_mat_vec_i8_tensorwise<2>(stream, w, qdata_d, scales_d, weight_scales, bias, out, k, n); break;
+            case 3: launch_mul_mat_vec_i8_tensorwise<3>(stream, w, qdata_d, scales_d, weight_scales, bias, out, k, n); break;
+            case 4: launch_mul_mat_vec_i8_tensorwise<4>(stream, w, qdata_d, scales_d, weight_scales, bias, out, k, n); break;
+            case 5: launch_mul_mat_vec_i8_tensorwise<5>(stream, w, qdata_d, scales_d, weight_scales, bias, out, k, n); break;
+            case 6: launch_mul_mat_vec_i8_tensorwise<6>(stream, w, qdata_d, scales_d, weight_scales, bias, out, k, n); break;
+            case 7: launch_mul_mat_vec_i8_tensorwise<7>(stream, w, qdata_d, scales_d, weight_scales, bias, out, k, n); break;
+            default: launch_mul_mat_vec_i8_tensorwise<8>(stream, w, qdata_d, scales_d, weight_scales, bias, out, k, n); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), (size_t)n * rows_padded);
 
     const int32_t alpha = 1;
