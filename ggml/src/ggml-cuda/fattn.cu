@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-dp4a.cuh"
 #include "fattn-gqa-q.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
@@ -538,6 +539,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_DP4A    = 300,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -647,6 +649,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (ggml_cuda_fattn_dp4a_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_DP4A;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -769,6 +775,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_DP4A:
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -797,6 +804,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_DP4A:
+            ggml_cuda_flash_attn_ext_dp4a(ctx, dst);
             break;
     }
 }
