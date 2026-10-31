@@ -238,7 +238,7 @@ static __global__ __launch_bounds__(DP4A_NT, 2) void fattn_dp4a_fwd(
 bool ggml_cuda_fattn_dp4a_supported(int device, const ggml_tensor * dst) {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_FATTN_DP4A");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;
     }();
     if (!enabled) {
         return false;
