@@ -5526,6 +5526,43 @@ struct test_mul_mat : public test_case {
 };
 
 // GGML_HINT_SRC0_IS_HADAMARD
+// INT8 tensorwise mul_mat (I8 weight rows + F32 per-row scale, activations quantized to INT8 on the fly), the
+// ComfyUI-style INT8/convrot format used by stable-diffusion.cpp. Included so the quant benchmark reports its speed.
+struct test_mul_mat_i8_tensorwise : public test_case {
+    const int64_t m;  // output features (rows of the weight)
+    const int64_t n;  // tokens
+    const int64_t k;  // input features
+    const int convrot_group_size;
+
+    std::string vars() override {
+        return VARS_TO_STR4(m, n, k, convrot_group_size);
+    }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    test_mul_mat_i8_tensorwise(int64_t m = 32, int64_t n = 32, int64_t k = 256, int convrot_group_size = 0)
+        : m(m), n(n), k(k), convrot_group_size(convrot_group_size) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, k, m);
+        ggml_set_name(weight, "weight");
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(input, "input");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(scale, "weight_scale");
+        ggml_tensor * out = ggml_mul_mat_i8_tensorwise(ctx, weight, input, scale, nullptr, convrot_group_size);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
@@ -11185,6 +11222,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    // INT8 tensorwise mul_mat, with and without the convrot rotation
+    for (int group_size : {0, 256}) {
+        test_cases.emplace_back(new test_mul_mat_i8_tensorwise(256, 16, 256, group_size));
+        test_cases.emplace_back(new test_mul_mat_i8_tensorwise(4096, 512, 1024, group_size));
+    }
+
 #if 0
     // > 2^31-element dst (8.9 GB), about 45 GB peak memory. Too large to be enabled by default.
     // kernel_mul_mm dst offset of the last batch is past INT32_MAX: rows 0-31 use full tiles, rows 32-39 use edge tiles.
@@ -12929,6 +12972,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 17408, bs, 5120, {1,  1}, {1, 1})); // 27B ffn up/gate
             }
+        }
+    }
+
+    // INT8 tensorwise (ComfyUI int8/convrot): same 27B-class shapes as the quantized mul_mat cases above
+    for (int bs : {1, 2, 3, 4, 5, 8, 512, 1024, 2048, 4096}) {
+        for (int group_size : {0, 256}) {
+            test_cases.emplace_back(new test_mul_mat_i8_tensorwise(4096, bs, 14336, group_size));
+            test_cases.emplace_back(new test_mul_mat_i8_tensorwise(17408, bs, 5120, group_size));
         }
     }
 
